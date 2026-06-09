@@ -27,14 +27,25 @@
  * 3. This notice may not be removed or altered from any source distribution.
  *
  ******************************************************************************/
+
 #include "em_common.h"
 #include "app_assert.h"
 #include "sl_bluetooth.h"
 #include "app.h"
 #include "app_log.h"
+#include "sl_sensor_rht.h"
+#include "temperature.h"
+#include "gatt_db.h"
+#include "sl_sleeptimer.h"
+#include "sl_simple_led_instances.h"
+
+#define TEMPERATURE_TIMER_SIGNAL (1 << 0)
 
 // The advertising set handle allocated from Bluetooth stack.
 static uint8_t advertising_set_handle = 0xff;
+static sl_sleeptimer_timer_handle_t temperature_timer;
+static uint32_t timer_step = 0;
+static uint8_t connection_handle = 0;
 
 /**************************************************************************//**
  * Application Init.
@@ -43,7 +54,9 @@ SL_WEAK void app_init(void)
 {
   /////////////////////////////////////////////////////////////////////////////
   // Put your additional application init code here!                         //
-  // This is called once during start-up.                                    //
+  // This is called once during start-up.
+  sl_sensor_rht_init();
+  sl_simple_led_init_instances();
   /////////////////////////////////////////////////////////////////////////////
   app_log_info("%s\n", __FUNCTION__);
 }
@@ -66,10 +79,22 @@ SL_WEAK void app_process_action(void)
  *
  * @param[in] evt Event coming from the Bluetooth stack.
  *****************************************************************************/
+
+static void temperature_timer_callback(sl_sleeptimer_timer_handle_t *handle, void *data)
+{
+  (void)handle;
+  (void)data;
+  timer_step++;
+  app_log_info("Timer step %lu\n", timer_step);
+  sl_bt_external_signal(TEMPERATURE_TIMER_SIGNAL);
+}
+
+
 void sl_bt_on_event(sl_bt_msg_t *evt)
 {
-  sl_status_t sc;
+   sl_status_t sc;
 
+  //sl_sensor_rht_init();
   switch (SL_BT_MSG_ID(evt->header)) {
     // -------------------------------
     // This event indicates the device has started and the radio is ready.
@@ -109,6 +134,7 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
     case sl_bt_evt_connection_closed_id:
       app_log_info("%s: connection_closed!\n", __FUNCTION__);
       // Generate data for advertising
+
       sc = sl_bt_legacy_advertiser_generate_data(advertising_set_handle,
                                                  sl_bt_advertiser_general_discoverable);
       app_assert_status(sc);
@@ -124,8 +150,78 @@ void sl_bt_on_event(sl_bt_msg_t *evt)
     ///////////////////////////////////////////////////////////////////////////
     case sl_bt_evt_gatt_server_user_read_request_id:
       app_log_info("%s: caracteristique lue!\n", __FUNCTION__);
+      if (evt->data.evt_gatt_server_user_read_request.characteristic == gattdb_temperature_0) {
+          app_log_info("%s: accès lecture caracteristique Temperature!\n", __FUNCTION__);
+          //lecture_temp();
+          int16_t temp_ble = lecture_temp();
+          uint16_t sent_len;
+          sl_status_t sc = sl_bt_gatt_server_send_user_read_response(evt->data.evt_gatt_server_user_read_request.connection,
+                                                                     gattdb_temperature_0,0,sizeof(temp_ble),(uint8_t*)&temp_ble,
+                                                                     &sent_len);
+          app_assert_status(sc);
+          app_log_info("%s: temperature envoyee\n", __FUNCTION__);
+      }
       break;
 
+    case sl_bt_evt_gatt_server_characteristic_status_id:
+      app_log_info("%s: on entre bien!\n", __FUNCTION__);
+      app_log_info("%s: on entre : log flag : %d\n", __FUNCTION__,
+                   evt->data.evt_gatt_server_characteristic_status.status_flags);
+      if ((evt->data.evt_gatt_server_characteristic_status.characteristic == gattdb_temperature_0)
+          && (evt->data.evt_gatt_server_characteristic_status.status_flags == sl_bt_gatt_server_client_config)) {
+        app_log_info("%s: accès caracteristique Temperature NOTIFY!\n", __FUNCTION__);
+        app_log_info("%s: client_config_flags = %d\n", __FUNCTION__,
+                     evt->data.evt_gatt_server_characteristic_status.client_config_flags);
+
+        if (evt->data.evt_gatt_server_characteristic_status.client_config_flags == sl_bt_gatt_server_notification) {
+          app_log_info("%s: demarrage du timer\n", __FUNCTION__);
+          connection_handle = evt->data.evt_gatt_server_characteristic_status.connection;
+          timer_step = 0;
+          sl_sleeptimer_start_periodic_timer_ms(&temperature_timer,1000,temperature_timer_callback,NULL,0,0);
+        } else {
+          app_log_info("%s: arret du timer\n", __FUNCTION__);
+          sl_sleeptimer_stop_timer(&temperature_timer);
+        }
+      }
+      break;
+
+    case sl_bt_evt_system_external_signal_id:
+      if (evt->data.evt_system_external_signal.extsignals == TEMPERATURE_TIMER_SIGNAL) {
+        app_log_info("%s: signal recu, envoi notification\n", __FUNCTION__);
+        int16_t temp_ble = lecture_temp();
+        sc = sl_bt_gatt_server_send_notification(connection_handle, gattdb_temperature_0,sizeof(temp_ble),
+                                                 (uint8_t*)&temp_ble);
+        app_assert_status(sc);
+      }
+      break;
+
+    case sl_bt_evt_gatt_server_user_write_request_id:
+      app_log_info("%s: ecriture caracteristique\n", __FUNCTION__);
+      if (evt->data.evt_gatt_server_user_write_request.characteristic == gattdb_digital_0) {
+        uint8_t valeur = evt->data.evt_gatt_server_user_write_request.value.data[0];
+        app_log_info("%s: ecriture sur Digital, valeur = %d\n", __FUNCTION__, valeur);
+        app_log_info("%s: att_opcode = %d\n", __FUNCTION__,
+                     evt->data.evt_gatt_server_user_write_request.att_opcode);
+
+        if (valeur == 0) {
+          for (uint8_t i = 0; i < SL_SIMPLE_LED_COUNT; i++) {
+            sl_led_turn_off(SL_SIMPLE_LED_INSTANCE(i));
+          }
+        } else {
+          for (uint8_t i = 0; i < SL_SIMPLE_LED_COUNT; i++) {
+            sl_led_turn_on(SL_SIMPLE_LED_INSTANCE(i));
+          }
+        }
+        if (evt->data.evt_gatt_server_user_write_request.att_opcode == sl_bt_gatt_write_request) {
+          sc = sl_bt_gatt_server_send_user_write_response(
+              evt->data.evt_gatt_server_user_write_request.connection, gattdb_digital_0, 0);
+          app_assert_status(sc);
+          app_log_info("%s: write with response\n", __FUNCTION__);
+        } else {
+          app_log_info("%s: Write without response\n", __FUNCTION__);
+        }
+      }
+      break;
     // -------------------------------
     // Default event handler.
     default:
